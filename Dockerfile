@@ -6,6 +6,7 @@ ENV PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y \
     python3 \
+    python3-venv \
     python3-pip \
     git \
     ffmpeg \
@@ -14,12 +15,16 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+RUN python3 -m venv /opt/venv
+
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN pip install --upgrade pip setuptools wheel
+
 COPY . /app
 
-RUN python3 -m pip install --upgrade pip --break-system-packages
+RUN pip install .
 
-RUN python3 -m pip install --break-system-packages .
+RUN pip install runpod
 
-RUN python3 -m pip install --break-system-packages runpod
-
-CMD ["python3", "-u", "handler.py"]
+CMD ["python", "-u", "handler.py"]
