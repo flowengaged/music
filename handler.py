@@ -101,9 +101,20 @@ def handler(job):
     if cfg_scale is not None:
         request["cfg_scale"] = float(cfg_scale)
 
+    # Optional sampling overrides (abc_sampling / semantic_sampling). The
+    # Sampling dataclass validates the ranges; semantic max_tokens is what
+    # caps the song length (25 codec tokens ≈ 1 second).
+    sampling_kwargs = {}
+    abc_sampling = data.get("abc_sampling")
+    if isinstance(abc_sampling, dict) and abc_sampling:
+        sampling_kwargs["abc_sampling"] = abc_sampling
+    semantic_sampling = data.get("semantic_sampling")
+    if isinstance(semantic_sampling, dict) and semantic_sampling:
+        sampling_kwargs["semantic_sampling"] = semantic_sampling
+
     output_dir = f"/tmp/{request['id']}"
 
-    song = pipe(**request)
+    song = pipe(**request, **sampling_kwargs)
 
     song.save_artifacts(output_dir)
 
