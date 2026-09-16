@@ -1,12 +1,23 @@
 import os
 import uuid
 import runpod
+import requests
 
 from yue2 import YuE2Pipeline
 
 
 MODEL_ID = os.getenv("YUE_MODEL", "m-a-p/YuE2-3B")
 VAE_ID = os.getenv("YUE_VAE", "m-a-p/YuE2-Vae")
+UPLOAD_URL = os.getenv("ARTIFACT_UPLOAD_URL", "").strip()
+UPLOAD_TOKEN = os.getenv("ARTIFACT_UPLOAD_TOKEN", "").strip()
+UPLOAD_NAMES = (
+    "audio.flac",
+    "score.abc",
+    "plan.json",
+    "result.json",
+    "config.json",
+    "request.json",
+)
 
 print("Loading YuE2...")
 
@@ -17,6 +28,46 @@ pipe = YuE2Pipeline.from_pretrained(
 )
 
 print("YuE2 loaded.")
+
+
+def upload_artifacts(output_dir, generation_id):
+    """Hand artifacts to the studio before this ephemeral worker goes away.
+
+    Serverless workers may terminate right after the request, so files in
+    /tmp are not durable. When ARTIFACT_UPLOAD_URL is configured the handler
+    POSTs them to the application, which stores them persistently and serves
+    them to the player. The handoff never fails the generation.
+    """
+    if not UPLOAD_URL:
+        return {
+            "artifacts_uploaded": False,
+            "upload_skipped": "ARTIFACT_UPLOAD_URL is not configured",
+        }
+
+    handles = []
+    try:
+        files = {"generation_id": (None, generation_id)}
+        for name in UPLOAD_NAMES:
+            path = os.path.join(output_dir, name)
+            if os.path.isfile(path):
+                handle = open(path, "rb")
+                handles.append(handle)
+                files[name] = (name, handle, "application/octet-stream")
+        headers = (
+            {"Authorization": f"Bearer {UPLOAD_TOKEN}"} if UPLOAD_TOKEN else {}
+        )
+        response = requests.post(
+            UPLOAD_URL, files=files, headers=headers, timeout=600
+        )
+        return {
+            "artifacts_uploaded": response.ok,
+            "upload_status": response.status_code,
+        }
+    except Exception as exc:  # noqa: BLE001 - never fail the song for this
+        return {"artifacts_uploaded": False, "upload_error": str(exc)[:300]}
+    finally:
+        for handle in handles:
+            handle.close()
 
 
 def handler(job):
@@ -45,12 +96,15 @@ def handler(job):
 
     song.save_artifacts(output_dir)
 
+    upload = upload_artifacts(output_dir, request["id"])
+
     return {
         "status": "completed",
         "audio_path": f"{output_dir}/audio.flac",
         "output_dir": output_dir,
         "seed": request["seed"],
         "truncated": song.truncated,
+        **upload,
     }
 
 
