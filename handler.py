@@ -90,6 +90,17 @@ def handler(job):
         "seed": int(data.get("seed", 42)),
     }
 
+    # External composition (cover workflow) and text guidance are part of the
+    # SongRequest protocol; pass them through when provided. SongRequest itself
+    # validates the rules (abc requires cot=full|melody, cfg_scale in [0,20]).
+    abc = data.get("abc")
+    if isinstance(abc, str) and abc.strip():
+        request["abc"] = abc
+
+    cfg_scale = data.get("cfg_scale")
+    if cfg_scale is not None:
+        request["cfg_scale"] = float(cfg_scale)
+
     output_dir = f"/tmp/{request['id']}"
 
     song = pipe(**request)
