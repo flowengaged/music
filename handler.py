@@ -179,8 +179,14 @@ def measure_loudness(output_dir):
     )
     report = process.stderr
 
+    # ebur128 streams per-frame progress lines; "I:" appears there from the
+    # very first silent frame (I: -70 LUFS). The authoritative values are in
+    # the final Summary block, so parse from the last "Summary:" onward.
+    summary_index = report.rfind("Summary:")
+    section = report[summary_index:] if summary_index >= 0 else report
+
     def grab(pattern):
-        match = re.search(pattern, report)
+        match = re.search(pattern, section)
         return float(match.group(1)) if match else None
 
     data = {
@@ -233,34 +239,37 @@ def handle_generate(data):
     extras = {}
 
     # Decoder choice is real: decoding the same latents with a second VAE is
-    # cheap relative to synthesis. "legacy" makes the legacy decode the
-    # primary audio and keeps the standard one alongside for A/B.
+    # cheap relative to synthesis. The chosen decoder is the primary
+    # audio.flac; the other one is kept alongside for A/B.
     decoder = str(data.get("decoder") or "standard").strip().lower()
     dual = bool(data.get("dual_decode"))
     if decoder == "legacy" or dual:
         legacy_vae = str(data.get("legacy_vae") or LEGACY_VAE_ID)
         if decoder == "legacy":
-            standard_path = os.path.join(output_dir, "audio-standard.flac")
-            os.replace(os.path.join(output_dir, "audio.flac"), standard_path)
-        audio_legacy = pipe.decode(song.latents, vae=legacy_vae)
-        sf.write(
-            os.path.join(output_dir, "audio.flac"),
-            audio_legacy,
-            song.sample_rate,
-            subtype="PCM_24",
-        )
-        if decoder == "standard":
-            sf.write(
+            # Standard decode (already written by save_artifacts) becomes the
+            # extra; the legacy decode becomes the primary audio.flac.
+            os.replace(
+                os.path.join(output_dir, "audio.flac"),
                 os.path.join(output_dir, "audio-standard.flac"),
-                song.audio,
+            )
+            audio_legacy = pipe.decode(song.latents, vae=legacy_vae)
+            sf.write(
+                os.path.join(output_dir, "audio.flac"),
+                audio_legacy,
                 song.sample_rate,
                 subtype="PCM_24",
             )
-        extras["decode"] = {
-            "primary": "legacy" if decoder == "legacy" else "standard",
-            "legacy_vae": legacy_vae,
-            "dual": dual,
-        }
+            extras["decode"] = {"primary": "legacy", "legacy_vae": legacy_vae}
+        else:
+            # Standard stays primary; the legacy decode is the extra.
+            audio_legacy = pipe.decode(song.latents, vae=legacy_vae)
+            sf.write(
+                os.path.join(output_dir, "audio-legacy.flac"),
+                audio_legacy,
+                song.sample_rate,
+                subtype="PCM_24",
+            )
+            extras["decode"] = {"primary": "standard", "legacy_vae": legacy_vae}
 
     audio_formats = data.get("audio_formats")
     if isinstance(audio_formats, list) and audio_formats:
