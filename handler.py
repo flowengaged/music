@@ -127,6 +127,48 @@ def build_sampling(data):
     return sampling_kwargs
 
 
+def normalize_bpm(value):
+    if value is None:
+        return None
+    match = re.search(r"\d+(?:\.\d+)?", str(value))
+    if not match:
+        return None
+    bpm = int(round(float(match.group(0))))
+    return bpm if 20 <= bpm <= 300 else None
+
+
+def set_abc_tempo(text, bpm):
+    """Rewrite (or insert) the Q: tempo header. Mirrors the studio's tool."""
+    header = f"Q:1/4={bpm}"
+    if re.search(r"^Q:.*$", text, flags=re.M):
+        return re.sub(r"^Q:.*$", header, text, count=1, flags=re.M)
+    lines = text.split("\n")
+    index = next(
+        (i for i, line in enumerate(lines) if line.strip().startswith("K:")),
+        None,
+    )
+    lines.insert(index if index is not None else len(lines), header)
+    return "\n".join(lines)
+
+
+def plan_with_bpm(request, sampling_kwargs, bpm):
+    """Plan the score and, when the caller asked for a tempo, enforce it.
+
+    Style text only hints at a BPM; the model picks its own Q: otherwise
+    (measured live: "60 bpm" style produced Q:1/4=70). The adjusted ABC is
+    then used as the external composition so the semantic stage - and the
+    saved artifacts - follow the requested tempo. An ABC supplied by the
+    caller is authoritative and never touched.
+    """
+    plan = pipe.plan(**request, **sampling_kwargs)
+    if not bpm or request.get("abc") or not plan.abc:
+        return plan
+    adjusted = set_abc_tempo(plan.abc, bpm)
+    if adjusted == plan.abc:
+        return plan
+    return pipe.plan(**{**request, "abc": adjusted}, **sampling_kwargs)
+
+
 def run_ffmpeg(args):
     subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
@@ -206,9 +248,7 @@ def handle_plan(data):
     sampling_kwargs = build_sampling(data)
     output_dir = f"/tmp/{request['id']}"
 
-    # plan() takes the same keyword request fields as __call__ (it builds the
-    # SongRequest internally); passing a dict as `request=` bypasses that.
-    plan = pipe.plan(**request, **sampling_kwargs)
+    plan = plan_with_bpm(request, sampling_kwargs, normalize_bpm(data.get("bpm")))
     plan.save(output_dir)
 
     with open(os.path.join(output_dir, "request.json"), "w", encoding="utf-8") as fh:
@@ -232,6 +272,13 @@ def handle_generate(data):
     request = build_request(data)
     sampling_kwargs = build_sampling(data)
     output_dir = f"/tmp/{request['id']}"
+
+    bpm = normalize_bpm(data.get("bpm"))
+    if bpm and not request.get("abc"):
+        # Plan first so the requested tempo can be enforced, then render the
+        # adjusted score as the external composition.
+        plan = plan_with_bpm(request, sampling_kwargs, bpm)
+        request = {**request, "abc": plan.abc}
 
     song = pipe(**request, **sampling_kwargs)
     song.save_artifacts(output_dir)
