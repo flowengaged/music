@@ -1,16 +1,24 @@
+import json
 import os
+import re
+import subprocess
+import time
 import uuid
-import runpod
+
 import requests
+import runpod
+import soundfile as sf
 
 from yue2 import YuE2Pipeline
 
 
 MODEL_ID = os.getenv("YUE_MODEL", "m-a-p/YuE2-3B")
 VAE_ID = os.getenv("YUE_VAE", "m-a-p/YuE2-Vae")
+LEGACY_VAE_ID = os.getenv("YUE_VAE_LEGACY", "m-a-p/YuE2-Vae-legacy")
 UPLOAD_URL = os.getenv("ARTIFACT_UPLOAD_URL", "").strip()
 UPLOAD_TOKEN = os.getenv("ARTIFACT_UPLOAD_TOKEN", "").strip()
-UPLOAD_NAMES = (
+
+GENERATE_NAMES = (
     "audio.flac",
     "score.abc",
     "plan.json",
@@ -18,6 +26,15 @@ UPLOAD_NAMES = (
     "config.json",
     "request.json",
 )
+PLAN_NAMES = (
+    "request.json",
+    "score.abc",
+    "plan.json",
+    "plan_manifest.json",
+    "abc_tokens.npy",
+    "prefix.npy",
+)
+EXTRA_NAMES = ("audio-legacy.flac", "audio.mp3", "audio.wav", "loudness.json")
 
 print("Loading YuE2...")
 
@@ -30,7 +47,7 @@ pipe = YuE2Pipeline.from_pretrained(
 print("YuE2 loaded.")
 
 
-def upload_artifacts(output_dir, generation_id):
+def upload_artifacts(output_dir, generation_id, names):
     """Hand artifacts to the studio before this ephemeral worker goes away.
 
     Serverless workers may terminate right after the request, so files in
@@ -47,7 +64,7 @@ def upload_artifacts(output_dir, generation_id):
     handles = []
     try:
         files = {"generation_id": (None, generation_id)}
-        for name in UPLOAD_NAMES:
+        for name in names:
             path = os.path.join(output_dir, name)
             if os.path.isfile(path):
                 handle = open(path, "rb")
@@ -70,22 +87,11 @@ def upload_artifacts(output_dir, generation_id):
             handle.close()
 
 
-def handler(job):
-    data = job.get("input", {})
-
-    style = data.get("style")
-    lyrics = data.get("lyrics")
-
-    if not style:
-        return {"error": "Missing 'style'."}
-
-    if not lyrics:
-        return {"error": "Missing 'lyrics'."}
-
+def build_request(data):
     request = {
         "id": data.get("id", str(uuid.uuid4())),
-        "style": style,
-        "lyrics": lyrics,
+        "style": data.get("style"),
+        "lyrics": data.get("lyrics"),
         "cot": data.get("cot", "full"),
         "seed": int(data.get("seed", 42)),
     }
@@ -101,9 +107,10 @@ def handler(job):
     if cfg_scale is not None:
         request["cfg_scale"] = float(cfg_scale)
 
-    # Optional sampling overrides (abc_sampling / semantic_sampling). The
-    # Sampling dataclass validates the ranges; semantic max_tokens is what
-    # caps the song length (25 codec tokens ≈ 1 second).
+    return request
+
+
+def build_sampling(data):
     sampling_kwargs = {}
     abc_sampling = data.get("abc_sampling")
     if isinstance(abc_sampling, dict) and abc_sampling:
@@ -111,14 +118,137 @@ def handler(job):
     semantic_sampling = data.get("semantic_sampling")
     if isinstance(semantic_sampling, dict) and semantic_sampling:
         sampling_kwargs["semantic_sampling"] = semantic_sampling
+    return sampling_kwargs
 
+
+def run_ffmpeg(args):
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
+        check=True,
+        capture_output=True,
+        timeout=900,
+    )
+
+
+def convert_formats(output_dir, formats):
+    results = {}
+    source = os.path.join(output_dir, "audio.flac")
+    if not os.path.isfile(source):
+        return results
+    for fmt in formats:
+        target = os.path.join(output_dir, f"audio.{fmt}")
+        try:
+            if fmt == "mp3":
+                run_ffmpeg(["-i", source, "-codec:a", "libmp3lame", "-b:a", "320k", target])
+            elif fmt == "wav":
+                run_ffmpeg(["-i", source, "-c:a", "pcm_s24le", target])
+            else:
+                continue
+            results[fmt] = os.path.isfile(target)
+        except Exception as exc:  # noqa: BLE001 - delivery extra, never fatal
+            results[fmt] = f"failed: {str(exc)[:200]}"
+    return results
+
+
+def measure_loudness(output_dir):
+    source = os.path.join(output_dir, "audio.flac")
+    if not os.path.isfile(source):
+        return {"error": "audio.flac not found"}
+    process = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            source,
+            "-filter_complex",
+            "ebur128=peak=true",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    report = process.stderr
+
+    def grab(pattern):
+        match = re.search(pattern, report)
+        return float(match.group(1)) if match else None
+
+    data = {
+        "integrated_lufs": grab(r"I:\s*(-?\d+(?:\.\d+)?)\s*LUFS"),
+        "loudness_range_lu": grab(r"LRA:\s*(-?\d+(?:\.\d+)?)\s*LU"),
+        "true_peak_dbfs": grab(r"Peak:\s*(-?\d+(?:\.\d+)?)\s*dBFS"),
+        "source": "ffmpeg ebur128 (EBU R128)",
+        "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with open(os.path.join(output_dir, "loudness.json"), "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    return data
+
+
+def handle_plan(data):
+    request = build_request(data)
+    sampling_kwargs = build_sampling(data)
+    output_dir = f"/tmp/{request['id']}"
+
+    plan = pipe.plan(request=request, **sampling_kwargs)
+    plan.save(output_dir)
+
+    with open(os.path.join(output_dir, "request.json"), "w", encoding="utf-8") as fh:
+        json.dump(request, fh, indent=2)
+
+    upload = upload_artifacts(output_dir, request["id"], PLAN_NAMES)
+
+    return {
+        "status": "planned",
+        "score_abc": plan.abc,
+        "timing": {"abc": plan.timing},
+        "seed": request["seed"],
+        "truncated": {"abc": plan.truncated, "semantic": False},
+        "output_dir": output_dir,
+        "audio_path": None,
+        **upload,
+    }
+
+
+def handle_generate(data):
+    request = build_request(data)
+    sampling_kwargs = build_sampling(data)
     output_dir = f"/tmp/{request['id']}"
 
     song = pipe(**request, **sampling_kwargs)
-
     song.save_artifacts(output_dir)
 
-    upload = upload_artifacts(output_dir, request["id"])
+    extras = {}
+
+    # Producer A/B: decode the same latents with the legacy VAE (paper
+    # baseline) so the studio can compare converters on one performance.
+    if data.get("dual_decode"):
+        legacy_vae = str(data.get("legacy_vae") or LEGACY_VAE_ID)
+        audio_legacy = pipe.decode(song.latents, vae=legacy_vae)
+        sf.write(
+            os.path.join(output_dir, "audio-legacy.flac"),
+            audio_legacy,
+            song.sample_rate,
+            subtype="PCM_24",
+        )
+        extras["legacy_decode"] = {"vae": legacy_vae, "written": True}
+
+    audio_formats = data.get("audio_formats")
+    if isinstance(audio_formats, list) and audio_formats:
+        extras["formats"] = convert_formats(
+            output_dir, [str(fmt).lower() for fmt in audio_formats]
+        )
+
+    if data.get("analyze_loudness"):
+        extras["loudness"] = measure_loudness(output_dir)
+
+    upload = upload_artifacts(
+        output_dir, request["id"], GENERATE_NAMES + EXTRA_NAMES
+    )
 
     return {
         "status": "completed",
@@ -126,8 +256,24 @@ def handler(job):
         "output_dir": output_dir,
         "seed": request["seed"],
         "truncated": song.truncated,
+        "extras": extras,
         **upload,
     }
+
+
+def handler(job):
+    data = job.get("input", {})
+
+    if not data.get("style"):
+        return {"error": "Missing 'style'."}
+
+    if not data.get("lyrics"):
+        return {"error": "Missing 'lyrics'."}
+
+    action = str(data.get("action") or "generate").strip().lower()
+    if action == "plan":
+        return handle_plan(data)
+    return handle_generate(data)
 
 
 if __name__ == "__main__":
