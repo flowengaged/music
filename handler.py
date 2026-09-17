@@ -34,7 +34,13 @@ PLAN_NAMES = (
     "abc_tokens.npy",
     "prefix.npy",
 )
-EXTRA_NAMES = ("audio-legacy.flac", "audio.mp3", "audio.wav", "loudness.json")
+EXTRA_NAMES = (
+    "audio-standard.flac",
+    "audio-legacy.flac",
+    "audio.mp3",
+    "audio.wav",
+    "loudness.json",
+)
 
 print("Loading YuE2...")
 
@@ -224,18 +230,35 @@ def handle_generate(data):
 
     extras = {}
 
-    # Producer A/B: decode the same latents with the legacy VAE (paper
-    # baseline) so the studio can compare converters on one performance.
-    if data.get("dual_decode"):
+    # Decoder choice is real: decoding the same latents with a second VAE is
+    # cheap relative to synthesis. "legacy" makes the legacy decode the
+    # primary audio and keeps the standard one alongside for A/B.
+    decoder = str(data.get("decoder") or "standard").strip().lower()
+    dual = bool(data.get("dual_decode"))
+    if decoder == "legacy" or dual:
         legacy_vae = str(data.get("legacy_vae") or LEGACY_VAE_ID)
+        if decoder == "legacy":
+            standard_path = os.path.join(output_dir, "audio-standard.flac")
+            os.replace(os.path.join(output_dir, "audio.flac"), standard_path)
         audio_legacy = pipe.decode(song.latents, vae=legacy_vae)
         sf.write(
-            os.path.join(output_dir, "audio-legacy.flac"),
+            os.path.join(output_dir, "audio.flac"),
             audio_legacy,
             song.sample_rate,
             subtype="PCM_24",
         )
-        extras["legacy_decode"] = {"vae": legacy_vae, "written": True}
+        if decoder == "standard":
+            sf.write(
+                os.path.join(output_dir, "audio-standard.flac"),
+                song.audio,
+                song.sample_rate,
+                subtype="PCM_24",
+            )
+        extras["decode"] = {
+            "primary": "legacy" if decoder == "legacy" else "standard",
+            "legacy_vae": legacy_vae,
+            "dual": dual,
+        }
 
     audio_formats = data.get("audio_formats")
     if isinstance(audio_formats, list) and audio_formats:
