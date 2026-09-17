@@ -160,13 +160,18 @@ def plan_with_bpm(request, sampling_kwargs, bpm):
     saved artifacts - follow the requested tempo. An ABC supplied by the
     caller is authoritative and never touched.
     """
-    plan = pipe.plan(**request, **sampling_kwargs)
+    # plan() defines abc_sampling explicitly; semantic_sampling would land in
+    # **kwargs and blow up SongRequest.__init__.
+    plan_kwargs = {
+        key: value for key, value in sampling_kwargs.items() if key == "abc_sampling"
+    }
+    plan = pipe.plan(**request, **plan_kwargs)
     if not bpm or request.get("abc") or not plan.abc:
         return plan
     adjusted = set_abc_tempo(plan.abc, bpm)
     if adjusted == plan.abc:
         return plan
-    return pipe.plan(**{**request, "abc": adjusted}, **sampling_kwargs)
+    return pipe.plan(**{**request, "abc": adjusted}, **plan_kwargs)
 
 
 def run_ffmpeg(args):
