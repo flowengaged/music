@@ -200,7 +200,9 @@ def handle_plan(data):
     sampling_kwargs = build_sampling(data)
     output_dir = f"/tmp/{request['id']}"
 
-    plan = pipe.plan(request=request, **sampling_kwargs)
+    # plan() takes the same keyword request fields as __call__ (it builds the
+    # SongRequest internally); passing a dict as `request=` bypasses that.
+    plan = pipe.plan(**request, **sampling_kwargs)
     plan.save(output_dir)
 
     with open(os.path.join(output_dir, "request.json"), "w", encoding="utf-8") as fh:
